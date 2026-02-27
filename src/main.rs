@@ -141,6 +141,30 @@ impl HuffmanTree {
             }
         }
     }
+
+    pub fn deserialize_shape(bit_iter: &mut impl Iterator<Item = bool>) -> Self {
+        Self {
+            root: Box::new(Self::deserialize_recursive(bit_iter)),
+        }
+    }
+
+    fn deserialize_recursive(bit_iter: &mut impl Iterator<Item = bool>) -> HuffmanNode {
+        let is_leaf = bit_iter.next().expect("Something wrong with bitstream");
+        
+        if is_leaf {
+            let mut byte = 0u8;
+            for i in 0..8 {
+                if bit_iter.next().unwrap() {
+                    byte |= 1 << (7 - i); 
+                }
+            }
+            HuffmanNode::new_leaf(0, byte)
+        } else {
+            let left = Self::deserialize_recursive(bit_iter);
+            let right = Self::deserialize_recursive(bit_iter);
+            HuffmanNode::new_internal(left, right)
+        }
+    }
 }
 
 pub struct HuffmanArchive;
@@ -155,29 +179,92 @@ impl HuffmanArchive {
 
         let mut archive = BitVec::<u8, Msb0>::new();
         
-        // Magic Number
         archive.extend_from_bitslice(b"JP".view_bits::<Msb0>());
         
-        // Metadata
         archive.extend_from_bitslice(tree_len.to_be_bytes().view_bits::<Msb0>());
         archive.extend_from_bitslice(data_len.to_be_bytes().view_bits::<Msb0>());
         
-        // Tree Structure
         archive.extend_from_bitslice(&tree_bits);
 
-        // Encoded Data
         for &byte in data {
             archive.extend_from_bitslice(&encoding_table[byte as usize]);
         }
 
         archive
     }
+
+    pub fn decompress(archive_bytes: &[u8]) -> Option<Vec<u8>> {
+        if archive_bytes.len() < 2 {
+            eprintln!("Error: File too small.");
+            return None;
+        }
+
+        if &archive_bytes[0..2] != b"JP" {
+            eprintln!("Error: Invalid magic number.");
+            return None;
+        }
+
+        let _tree_len = u64::from_be_bytes(archive_bytes[2..10].try_into().unwrap());
+        let data_len = u64::from_be_bytes(archive_bytes[10..18].try_into().unwrap());
+
+        let bits = archive_bytes.view_bits::<Msb0>();
+        let mut bit_iter = bits[144..].iter().by_vals();
+
+        let tree = HuffmanTree::deserialize_shape(&mut bit_iter);
+
+        let mut output = Vec::with_capacity(data_len as usize);
+        let mut current_node = &*tree.root;
+
+        while output.len() < data_len as usize {
+            let bit = bit_iter.next().expect("Ran out of bits before reaching data_len");
+
+            if !bit {
+                current_node = current_node.l_child.as_deref().unwrap();
+            } else {
+                current_node = current_node.r_child.as_deref().unwrap();
+            }
+
+            if let Some(byte) = current_node.byte {
+                output.push(byte);
+                current_node = &*tree.root; 
+            }
+        }
+
+        Some(output)
+    }
 }
 
 fn main() {
-    let mut input = Vec::new();
-    io::stdin().read_to_end(&mut input).expect("Failed to read from stdin");
+    let args: Vec<String> = std::env::args().collect();
+    let decompress_mode = args.contains(&"-d".to_string());
 
-    let tree = HuffmanTree::build(&input);
-    let compressed_data = HuffmanArchive::compress(&input, &tree);
+    let mut input_buffer = Vec::new();
+    io::stdin()
+        .read_to_end(&mut input_buffer)
+        .expect("Failed to read from stdin");
+
+    if input_buffer.is_empty() {
+        return;
+    }
+
+    if decompress_mode {
+        match HuffmanArchive::decompress(&input_buffer) {
+            Some(original_data) => {
+                let mut out = io::stdout().lock();
+                io::Write::write_all(&mut out, &original_data).expect("Failed to write to stdout");
+            }
+            None => {
+                eprintln!("Error: Could not decompress.");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        let tree = HuffmanTree::build(&input_buffer);
+        let compressed_bitvec = HuffmanArchive::compress(&input_buffer, &tree);
+        
+        let compressed_bytes = compressed_bitvec.as_raw_slice();
+        
+        let mut out = io::stdout().lock();
+        io::Write::write_all(&mut out, compressed_bytes).expect("Failed to write to stdout");
+    }
 }
